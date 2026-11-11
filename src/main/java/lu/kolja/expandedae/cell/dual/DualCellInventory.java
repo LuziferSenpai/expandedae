@@ -6,6 +6,7 @@ import appeng.api.config.IncludeExclude;
 import appeng.api.networking.security.IActionSource;
 import appeng.api.stacks.AEItemKey;
 import appeng.api.stacks.AEKey;
+import appeng.api.stacks.AEKeyType;
 import appeng.api.stacks.KeyCounter;
 import appeng.api.storage.StorageCells;
 import appeng.api.storage.cells.CellState;
@@ -51,10 +52,10 @@ public class DualCellInventory implements StorageCell {
     private Object2LongMap<AEKey> storedAmounts;
     private final ItemStack i;
     private final IDualCellItem cellType;
-    private final long maxItemsPerType; // max items per type, basically infinite unless there is a distribution card.
+    private final long distributionBytes;
+    private final long distributionTypes;
     private final boolean hasVoidUpgrade;
     private boolean isPersisted = true;
-    private final int maxAmountPerType;
 
     private DualCellInventory(IDualCellItem cellType, ItemStack o, ISaveProvider container) {
         this.i = o;
@@ -73,7 +74,6 @@ public class DualCellInventory implements StorageCell {
         this.storedItemCount = getTag().getLong(ITEM_COUNT_TAG);
         this.storedAmounts = null;
         this.keyTypes = cellType.getKeyTypes();
-        this.maxAmountPerType = keyTypes.maxTypes();
 
         // Updates the partition list and mode based on installed upgrades and the configured filter.
         var builder = IPartitionList.builder();
@@ -101,11 +101,11 @@ public class DualCellInventory implements StorageCell {
             }
             maxTypes = Math.min(maxTypes, this.maxItemTypes);
 
-            long totalStorage = (getTotalBytes() - getBytesPerType() * maxTypes) * maxAmountPerType;
-            // Technically not exactly evenly distributed, but close enough!
-            this.maxItemsPerType = Math.max(0, (totalStorage + maxTypes - 1) / maxTypes);
+            this.distributionTypes = maxTypes;
+            this.distributionBytes = Math.max(0, getTotalBytes() - getBytesPerType() * maxTypes);
         } else {
-            this.maxItemsPerType = Long.MAX_VALUE;
+            this.distributionTypes = 1;
+            this.distributionBytes = -1;
         }
 
         this.hasVoidUpgrade = upgrades.isInstalled(AEItems.VOID_CARD);
@@ -283,7 +283,7 @@ public class DualCellInventory implements StorageCell {
     public boolean canHoldNewItem() {
         final long bytesFree = this.getFreeBytes();
         return (bytesFree > this.getBytesPerType()
-                || bytesFree == this.getBytesPerType() && this.getUnusedItemCount() > 0)
+                || bytesFree == this.getBytesPerType() && this.hasAnyRoom())
                 && this.getRemainingItemTypes() > 0;
     }
 
@@ -310,23 +310,50 @@ public class DualCellInventory implements StorageCell {
     }
 
     public long getUsedBytes() {
-        var bytesForItemCount = (this.getStoredItemCount() + this.getUnusedItemCount()) / maxAmountPerType;
+        long bytesForItemCount = 0;
+
+        for (var entry : getStoredCountPerKeyType().object2LongEntrySet()) {
+            var amountPerByte = entry.getKey().getAmountPerByte();
+
+            bytesForItemCount += (entry.getLongValue() + amountPerByte - 1) / amountPerByte;
+        }
+
         return this.getStoredItemTypes() * this.getBytesPerType() + bytesForItemCount;
     }
 
-    public long getRemainingItemCount() {
-        final long remaining = this.getFreeBytes() * maxAmountPerType + this.getUnusedItemCount();
+    private Object2LongMap<AEKeyType> getStoredCountPerKeyType() {
+        var counts = new Object2LongOpenHashMap<AEKeyType>();
+
+        for (var entry : this.getCellItems().object2LongEntrySet()) {
+            counts.addTo(entry.getKey().getType(), entry.getLongValue());
+        }
+
+        return counts;
+    }
+
+    public long getRemainingItemCount(AEKeyType keyType) {
+        long remaining = this.getFreeBytes() * keyType.getAmountPerByte() + this.getUnusedItemCount(keyType);
+
         return remaining > 0 ? remaining : 0;
     }
 
-    public int getUnusedItemCount() {
-        final int div = (int) (this.getStoredItemCount() % maxAmountPerType);
+    public long getUnusedItemCount(AEKeyType keyType) {
+        long amountPerByte = keyType.getAmountPerByte();
+        long div = this.getStoredCountPerKeyType().getLong(keyType) % amountPerByte;
 
-        if (div == 0) {
-            return 0;
+        if (div == 0) return 0;
+
+        return amountPerByte - div;
+    }
+
+    private boolean hasAnyRoom() {
+        if (this.getFreeBytes() > 0) return true;
+
+        for (var type : keyTypes.keyTypes) {
+            if (getUnusedItemCount(type) > 0) return true;
         }
 
-        return maxAmountPerType - div;
+        return false;
     }
 
     @Override
@@ -337,7 +364,7 @@ public class DualCellInventory implements StorageCell {
         if (this.canHoldNewItem()) {
             return CellState.NOT_EMPTY;
         }
-        if (this.getRemainingItemCount() > 0) {
+        if (this.hasAnyRoom()) {
             return CellState.TYPES_FULL;
         }
         return CellState.FULL;
@@ -382,7 +409,8 @@ public class DualCellInventory implements StorageCell {
         }
 
         var currentAmount = this.getCellItems().getLong(what);
-        long remainingItemCount = this.getRemainingItemCount();
+        long amountPerByte = what.getType().getAmountPerByte();
+        long remainingItemCount = this.getRemainingItemCount(what.getType());
 
         // Deduct the required storage for a new type if the type is new
         if (currentAmount <= 0) {
@@ -391,14 +419,19 @@ public class DualCellInventory implements StorageCell {
                 return 0;
             }
 
-            remainingItemCount -= this.getBytesPerType() * maxAmountPerType;
+            remainingItemCount -= this.getBytesPerType() * amountPerByte;
             if (remainingItemCount <= 0) {
                 return 0;
             }
         }
 
         // Apply max items per type
-        remainingItemCount = Math.max(0, Math.min(this.maxItemsPerType - currentAmount, remainingItemCount));
+        if (distributionBytes >= 0) {
+            long totalStorage = distributionBytes * amountPerByte;
+            long maxItemsPerType = Math.max(0, (totalStorage + distributionTypes - 1) / distributionTypes);
+
+            remainingItemCount = Math.max(0, Math.min(maxItemsPerType - currentAmount, remainingItemCount));
+        }
 
         if (amount > remainingItemCount) {
             amount = remainingItemCount;

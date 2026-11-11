@@ -43,6 +43,8 @@ public class ExpUpgrades {
             for (var item : itemCells) {
                 add(AEItems.FUZZY_CARD, item, 1);
                 add(AEItems.INVERTER_CARD, item, 1);
+                add(AEItems.EQUAL_DISTRIBUTION_CARD, item, 1);
+                add(AEItems.VOID_CARD, item, 1);
             }
         });
     }

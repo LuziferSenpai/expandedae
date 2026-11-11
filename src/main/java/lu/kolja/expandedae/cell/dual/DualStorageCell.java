@@ -62,7 +62,7 @@ public class DualStorageCell extends AEBaseItem implements IDualCellItem {
         this.bytesPerType = bytesPerType;
         this.totalTypes = totalTypes;
         this.keyTypes = keyTypes;
-        this.keyFilter = what -> keyTypes.keyTypes.contains(what);
+        this.keyFilter = keyTypes::contains;
     }
 
     @Override
